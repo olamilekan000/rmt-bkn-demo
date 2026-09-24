@@ -11,17 +11,52 @@ if (!databaseUrl) {
   process.exit(1);
 }
 
-const pool = new Pool({
-  connectionString: databaseUrl,
-  ssl:
-    process.env.DATABASE_SSL === "true"
-      ? { rejectUnauthorized: false }
-      : undefined,
-});
+function poolSsl(url) {
+  if (process.env.DATABASE_SSL === "false") return false;
+  const value = url.toLowerCase();
+  const wantsSsl =
+    process.env.DATABASE_SSL === "true" ||
+    value.includes("sslmode=require") ||
+    value.includes("sslmode=verify");
+  return wantsSsl ? { rejectUnauthorized: false } : false;
+}
+
+function connectionStringWithoutSslMode(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.delete("sslmode");
+    parsed.searchParams.delete("uselibpqcompat");
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+function makePool(ssl) {
+  return new Pool({
+    connectionString: connectionStringWithoutSslMode(databaseUrl),
+    ssl,
+  });
+}
+
+let pool = makePool(poolSsl(databaseUrl));
 
 app.use(express.json());
 
-async function ready() {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isSslError(err) {
+  const message = String(err && err.message ? err.message : err).toLowerCase();
+  return (
+    message.includes("ssl") ||
+    message.includes("certificate") ||
+    message.includes("does not support")
+  );
+}
+
+async function ensureTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS items (
       id SERIAL PRIMARY KEY,
@@ -29,6 +64,29 @@ async function ready() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+}
+
+async function ready() {
+  let lastError;
+  let triedNoSsl = false;
+  for (let attempt = 1; attempt <= 20; attempt += 1) {
+    try {
+      await ensureTable();
+      return;
+    } catch (err) {
+      lastError = err;
+      if (!triedNoSsl && isSslError(err)) {
+        triedNoSsl = true;
+        await pool.end().catch(() => undefined);
+        pool = makePool(false);
+        console.error("retrying database without ssl");
+        continue;
+      }
+      console.error(`database not ready (${attempt}/20): ${err.message}`);
+      await sleep(1000);
+    }
+  }
+  throw lastError;
 }
 
 app.get("/", async (_req, res) => {
